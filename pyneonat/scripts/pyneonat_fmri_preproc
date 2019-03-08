@@ -1,0 +1,529 @@
+#! /usr/bin/env python
+# -*- coding: utf-8 -*
+##########################################################################
+# NSAp - Copyright (C) CEA, 2019
+# Distributed under the terms of the CeCILL-B license, as published by
+# the CEA-CNRS-INRIA. Refer to the LICENSE file or to
+# http://www.cecill.info/licences/Licence_CeCILL-B_V1-en.html for details.
+##########################################################################
+
+# System import
+import os
+import argparse
+import json
+from pprint import pprint
+from datetime import datetime
+import textwrap
+from argparse import RawTextHelpFormatter
+
+# Bredala module
+try:
+    import bredala
+    bredala.USE_PROFILER = False
+    bredala.register("pyconnectome.wrapper",
+                     names=["FSLWrapper.__call__"])
+    bredala.register("pyconnectome.utils.preproctools",
+                     names=["eddy", "fsl_prepare_fieldmap"])
+    bredala.register("pyconnectome.utils.segtools",
+                     names=["bet2"])
+    bredala.register("pyconnectome.utils.regtools",
+                     names=["flirt"])
+    bredala.register("pyconnectome.utils.filetools",
+                     names=["apply_mask"])
+    bredala.register("scipy.signal",
+                     names=["savgol_filter"])
+except:
+    pass
+
+# Package import
+from pyneonat import __version__ as version
+
+
+# Third party import
+import nibabel
+import numpy
+from scipy.signal import savgol_filter
+from pyconnectome.wrapper import FSLWrapper
+from pyconnectome import DEFAULT_FSL_PATH
+from pyconnectome.exceptions import FSLRuntimeError
+from pyconnectome.utils.preproctools import eddy
+from pyconnectome.utils.preproctools import fsl_prepare_fieldmap
+from pyconnectome.utils.regtools import flirt
+from pyconnectome.utils.segtools import bet2
+from pyconnectome.utils.filetools import apply_mask
+
+
+
+# Parameters to keep trace
+__hopla__ = ["runtime", "inputs", "outputs"]
+
+
+DOC = """
+Neonatal fMRI data analysis
+---------------------------
+
+Implement the method described in "Optimising neonatal fMRI data analysis:
+Design and validation of an extended dHCP preprocessing pipeline to
+characterise noxious-evoked brain activity in infants"
+
+Command example:
+
+python $HOME/git/pyneonat/pyneonat/scripts/pyneonat_fmri_preproc \
+    -i /neurospin/nsap/processed/pyneonat/data/bb25_test.nii.gz \
+    -p /neurospin/nsap/processed/pyneonat/data/025_t1.nii.gz \
+    -o /neurospin/nsap/processed/pyneonat/data \
+    -m /neurospin/nsap/processed/pyneonat/data/025_mag.nii.gz \
+    -p /neurospin/nsap/processed/pyneonat/data/025_phase.nii.gz \
+    -a SIEMENS \
+    -e y \
+    -d 1 \
+    -r 1 \
+    -t 2 \
+    -f /neurospin/nsap/local/fix1.067 \
+    -F /neurospin/nsap/local/fsl-5.0.11.sh \
+    -V 2
+
+
+python $HOME/git/pyneonat/pyneonat/scripts/pyneonat_fmri_preproc \
+    -i /neurospin/nsap/processed/pyneonat/data/registration/025/reorient/bb25_fmri_Lhand.nii.gz \
+    -k /neurospin/nsap/processed/pyneonat/data/registration/025/reorient/nobias_tact25.nii.gz \
+    -j /neurospin/nsap/processed/pyneonat/data/registration/025/flirt/flirt_nobias_tact25_to_template.txt \
+    -o /neurospin/nsap/processed/pyneonat/data/preproc \
+    -m /neurospin/nsap/processed/pyneonat/data/025_mag.nii.gz \
+    -p /neurospin/nsap/processed/pyneonat/data/025_phase.nii.gz \
+    -a SIEMENS \
+    -e y \
+    -d 1 \
+    -r 1 \
+    -t 2 \
+    -f /neurospin/nsap/local/fix1.067 \
+    -F /neurospin/nsap/local/fsl-5.0.11.sh \
+    -V 2
+"""
+
+
+def is_file(filepath):
+    """ Check file's existence - argparse 'type' argument.
+    """
+    if not os.path.isfile(filepath):
+        raise argparse.ArgumentError("File does not exist: %s" % filepath)
+    return filepath
+
+def is_directory(dirarg):
+    """ Type for argparse - checks that directory exists.
+    """
+    if not os.path.isdir(dirarg):
+        raise argparse.ArgumentError(
+            "The directory '{0}' does not exist!".format(dirarg))
+    return dirarg
+
+
+def get_cmd_line_args():
+    """
+    Create a command line argument parser and return a dict mapping
+    <argument name> -> <argument value>.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python pyneonat_fmri_preproc",
+        description=textwrap.dedent(DOC),
+        formatter_class=RawTextHelpFormatter)
+
+    # Required arguments
+    required = parser.add_argument_group("required arguments")
+    required.add_argument(
+        "-o", "--outdir",
+        type=is_directory, required=True, metavar="<path>",
+        help="Directory where to output.")
+    required.add_argument(
+        "-i", "--func",
+        type=is_file, required=True, metavar="<path>",
+        help="Path to the functional data.")
+    required.add_argument(
+        "-j", "--struct-to-func",
+        type=is_file, required=True, metavar="<path>",
+        help="The FLIRT transform from structural to functional space.")
+    required.add_argument(
+        "-k", "--anat",
+        type=is_file, required=True, metavar="<path>",
+        help="Path to the anatomical data.")
+    required.add_argument(
+        "-s", "--anat-mask",
+        type=is_file, required=True, metavar="<path>",
+        help="Path to the anatomical mask data.")
+    required.add_argument(
+        "-m", "--magnitude",
+        type=is_file, required=True, metavar="<path>",
+        help="Two magnitude fieldmap image from a SIEMENS scanner (one for "
+             "each echo time).")
+    required.add_argument(
+        "-p", "--phase",
+        type=is_file, required=True, metavar="<path>",
+        help="Phase difference fieldmap image from a SIEMENS scanner.")
+    required.add_argument(
+        "-d", "--delta-te",
+        required=True, type=float,
+        help=("The difference in msec between the 2 echoes of the B0 magnitude "
+              "map: find this out form the operator, defaults are usually "
+              "2.46ms on SIEMENS)"))
+    required.add_argument(
+        "-q", "--info",
+        type=is_file, required=True, metavar="<path>",
+        help="Path to the info JSON file as generate by "
+             "'pyconnectome_get_eddy_data'.")
+    parser.add_argument(
+        "-f", "--fix-dir",
+        type=is_directory, metavar="<path>",
+        help="The FIX install directory.")
+
+    # Optional arguments
+    parser.add_argument(
+        "-V", "--verbose",
+        type=int, choices=[0, 1, 2], default=2,
+        help="Increase the verbosity level: 0 silent, [1, 2] verbose.")
+    parser.add_argument(
+        "-C", "--with-cuda",
+        action="store_true",
+        help="If set assume everything is setup for GPU processings: this "
+             "option also activate the slice to volume registration.")
+    parser.add_argument(
+        "-L", "--mag-mask",
+        type=is_file, metavar="<path>",
+        help="Path to the magnitude mask image.")
+    parser.add_argument(
+        "-G", "--bet-mag-threshold",
+        type=float, default=0.65,
+        help="bet threshold for magnitude brain extraction.")
+    parser.add_argument(
+        "-H", "--highpass-thr",
+        type=float, default=100, metavar="<path>",
+        help="The temporal highpass full-width (2*sigma), in seconds, to "
+             "apply using 'fslmaths -bptf' for the highpass filtering. If "
+             "-1 is given this step i skiped. If a value < -1 is given, a "
+             "polynomial detrending is performed with the specified order.")
+    parser.add_argument(
+        "-I", "--fix-thr",
+        type=int, default=10, metavar="<path>",
+        help="Threshold setting in FIX that controls the "
+             "sensitivity/specificity tradeoff.")
+    parser.add_argument(
+        "-T", "--training-file",
+        type=is_file, metavar="<path>",
+        help="The training file used by FIX.")
+    parser.add_argument(
+        "-M", "--matlab-root",
+        type=is_directory, metavar="<path>",
+        help="The path to the matlab binary.")
+    parser.add_argument(
+        "-F", "--fsl-config",
+        type=is_file, metavar="<path>",
+        help="Bash script initializing FSL's environment.")
+
+    # Create a dict of arguments to pass to the 'main' function
+    args = parser.parse_args()
+    kwargs = vars(args)
+    verbose = kwargs.pop("verbose")
+    if kwargs["matlab_root"] is None:
+        kwargs["matlab_root"] = "/neurospin/local"
+    if kwargs["fsl_config"] is None:
+        kwargs["fsl_config"] = DEFAULT_FSL_PATH
+    if kwargs["training_file"] is None:
+        kwargs["training_file"] = os.path.join(
+            kwargs["fix_dir"], "training_files", "Standard.RData")
+
+    return kwargs, verbose
+
+
+"""
+Parse the command line.
+"""
+inputs, verbose = get_cmd_line_args()
+runtime = {
+    "tool": "pyneonat_fmri_preproc",
+    "timestamp": datetime.now().isoformat(),
+    "fsl_version": FSLWrapper([], shfile=inputs["fsl_config"]).version,
+    "tool_version": version
+}
+outputs = {}
+with open(inputs["info"], "rt") as open_file:
+    seq_info = json.load(open_file)
+if verbose > 0:
+    pprint("[info] Starting Neonat fMRI preproc...")
+    pprint("[info] Runtime:")
+    pprint(runtime)
+    pprint("[info] Inputs:")
+    pprint(inputs)
+    pprint("[info] Sequence info:")
+    pprint(seq_info)
+
+
+"""
+Step1: susceptibility correction
+FSL with B0 maps
+"""
+# Create output directory for this step
+susceptibility_dir = os.path.join(inputs["outdir"], "susceptibility")
+if not os.path.isdir(susceptibility_dir):
+    os.mkdir(susceptibility_dir)
+
+# Create a mask for the magnitude image: strict threshold in order
+# to avoid border outliers
+if inputs["mag_mask"] is None:
+    mag_brain, mag_brain_mask, _, _, _, _, _, _, _, _, _ = bet2(
+        input_file=inputs["magnitude"],
+        output_fileroot=susceptibility_dir,
+        mask=True,
+        skull=False,
+        f=inputs["bet_mag_threshold"],
+        shfile=inputs["fsl_config"])
+# Apply the mask
+else:
+    mag_brain_mask = inputs["mag_mask"]
+    mag_brain = os.path.join(
+        susceptibility_dir, os.path.basename(
+            inputs["magnitude"]).replace(".nii.gz", "_brain.nii.gz"))
+    apply_mask(
+        input_file=inputs["magnitude"],
+        output_fileroot=mag_brain.replace(".nii.gz", ""),
+        mask_file=mag_brain_mask,
+        fslconfig=inputs["fsl_config"])
+outputs["mag_brain"] = mag_brain
+outputs["mag_brain_mask"] = mag_brain_mask
+
+# Prepare the fieldmap
+# > Prepare a fieldmap from SIEMENS scanner into a rad/s fieldmap
+fieldmap_file = os.path.join(susceptibility_dir, "fieldmap.nii.gz")
+fieldmap_file, fieldmap_hz_file = fsl_prepare_fieldmap(
+    manufacturer=seq_info["Manufacturer"].upper(),
+    phase_file=inputs["phase"],
+    brain_magnitude_file=mag_brain,
+    output_file=fieldmap_file,
+    delta_te=str(inputs["delta_te"]),
+    fsl_sh=inputs["fsl_config"])
+# > Resample the fieldmap
+fieldmap_hz_to_func_file = fieldmap_hz_file.replace(
+    ".nii.gz", "_to_func.nii.gz")
+# TODO: register the mag to the func using the struct
+flirt(
+    in_file=fieldmap_hz_file,
+    ref_file=inputs["func"],
+    out=fieldmap_hz_to_func_file,
+    interp="nearestneighbour",
+    applyxfm=True,
+    shfile=inputs["fsl_config"])
+outputs["fieldmap"] = fieldmap_file
+outputs["fieldmap_hz"] = fieldmap_hz_file
+outputs["fieldmap_hz_to_func"] = fieldmap_hz_to_func_file
+
+
+"""
+Step2: Eddy.
+"""
+# Create output directory for this step
+eddy_dir = os.path.join(inputs["outdir"], "eddy")
+if not os.path.isdir(eddy_dir):
+    os.mkdir(eddy_dir)
+
+# Export mask from structural
+func_brain_mask = os.path.join(eddy_dir, "struct_to_func_mask.nii.gz")
+func_brain_mask, _ = flirt(
+    in_file=inputs["anat_mask"],
+    ref_file=inputs["func"],
+    out=func_brain_mask,
+    init=inputs["struct_to_func"],
+    applyxfm=True,
+    interp="nearestneighbour",
+    shfile=inputs["fsl_config"])
+outputs["func_brain_mask"] = func_brain_mask
+
+# Run volume to volume, slice to volume correction with susceptibility
+# correction
+im = nibabel.load(inputs["func"])
+nb_volumes = im.shape[-1]
+bvals = numpy.ones((nb_volumes, ), dtype=int) * 1000
+bvals[0] = 0
+bvecs = numpy.zeros((nb_volumes, 3), dtype=int)
+bvecs[:, 0] = 1
+bvals_file = os.path.join(eddy_dir, "eddy.bval")
+numpy.savetxt(bvals_file, bvals)
+bvecs_file = os.path.join(eddy_dir, "eddy.bvec")
+numpy.savetxt(bvecs_file, bvecs.T)
+acqp_file = seq_info["acqp"]
+index_file = seq_info["index"]
+# TODO: fix fieldmap
+eddy_fmri, _ = eddy(
+    dwi=inputs["func"],
+    dwi_brain_mask=func_brain_mask,
+    acqp=acqp_file,
+    index=index_file,
+    bvecs=bvecs_file,
+    bvals=bvals_file,
+    outroot=os.path.join(eddy_dir, "eddy"),
+    field=None, #fieldmap_hz_to_func_file.replace(".nii.gz", ""),
+    no_qspace_interpolation=True,
+    no_slice_correction=not inputs["with_cuda"],
+    strategy="cuda" if inputs["with_cuda"] else "openmp",
+    fsl_sh=inputs["fsl_config"])
+eddy_fmri = os.path.join(eddy_dir, "eddy.nii.gz")
+eddy_parameters = os.path.join(eddy_dir, "eddy.eddy_parameters")
+outputs["eddy_fmri"] = eddy_fmri
+outputs["eddy_parameters"] = eddy_parameters
+
+
+"""
+High pass filtering
+"""
+# Create output directory for this step
+highpass_dir = os.path.join(inputs["outdir"], "highpass")
+if not os.path.isdir(highpass_dir):
+    os.mkdir(highpass_dir)
+
+# Start detrending
+highpass_file = os.path.join(
+    highpass_dir, "filtered_" + os.path.basename(eddy_fmri))
+# Use a highpass filter: FSL
+if inputs["highpass_thr"] >= -1:
+    hptr = inputs["highpass_thr"] / (2 * seq_info["RepetitionTime"])
+    highpass_cmd = [
+        "fslmaths", eddy_fmri, "-bptf", str(hptr), "-1", highpass_file]
+    process = FSLWrapper(shfile=inputs["fsl_config"])
+    process(cmd=highpass_cmd)
+# Make a polynomial detrending using a Savitzky-Golay filter
+else:
+    im = nibabel.load(eddy_fmri)
+    arr = im.get_data()
+    arr = savgol_filter(arr, 41, int(abs(inputs["highpass_thr"])), axis=-1)
+    im = nibabel.Nifti1Image(arr, im.affine)
+    nibabel.save(im, highpass_file)
+outputs["highpass_file"] = highpass_file
+
+
+"""
+ICA: Melodic + fix
+"""
+# Create output directory for this step
+ica_dir = os.path.join(inputs["outdir"], "ica")
+if not os.path.isdir(ica_dir):
+    os.mkdir(ica_dir)
+
+# Start ICA using FSL melodic
+melodic_file = os.path.join(ica_dir, "filtered_func_data.ica")
+melodic_cmd= [
+    "melodic", "-i", highpass_file, "-o", melodic_file, "--nobet", "--report",
+    "--Oall", "--tr={0}".format(seq_info["RepetitionTime"]), "-v"]
+process = FSLWrapper(shfile=inputs["fsl_config"])
+process(cmd=melodic_cmd)
+if process.stderr != "":
+    raise FSLRuntimeError(
+        melodic_cmd[0], " ".join(melodic_cmd[1:]),
+        process.stderr + process.stdout)
+outputs["melodic_file"] = melodic_file
+
+
+# Files expected by FIX
+if not os.path.islink(os.path.join(ica_dir, "filtered_func_data.nii.gz")):
+    os.symlink(
+        highpass_file,
+        os.path.join(ica_dir, "filtered_func_data.nii.gz"))
+if not os.path.islink(os.path.join(ica_dir, "mask.nii.gz")):
+    os.symlink(
+        os.path.join(ica_dir, "filtered_func_data.ica", "mask.nii.gz"),
+        os.path.join(ica_dir, "mask.nii.gz"))
+if not os.path.islink(os.path.join(ica_dir, "mean_func.nii.gz")):
+    os.symlink(
+        os.path.join(ica_dir, "filtered_func_data.ica", "mean.nii.gz"),
+        os.path.join(ica_dir, "mean_func.nii.gz"))
+reg_dir = os.path.join(ica_dir, "reg")
+if not os.path.isdir(reg_dir):
+    os.mkdir(reg_dir)
+if not os.path.islink(os.path.join(reg_dir, "highres.nii.gz")):
+    os.symlink(
+        inputs["anat"],
+        os.path.join(reg_dir, "highres.nii.gz"))
+if not os.path.islink(os.path.join(reg_dir, "example_func.nii.gz")):
+    os.symlink(
+        os.path.join(ica_dir, "mean_func.nii.gz"),
+        os.path.join(reg_dir, "example_func.nii.gz"))
+if not os.path.islink(os.path.join(reg_dir, "highres2example_func.mat")):
+    os.symlink(
+        inputs["struct_to_func"],
+        os.path.join(reg_dir, "highres2example_func.mat"))
+mc_dir = os.path.join(ica_dir, "mc")
+if not os.path.isdir(mc_dir):
+    os.mkdir(mc_dir)
+params = numpy.loadtxt(eddy_parameters)
+_params = numpy.concatenate((params[:, 3:6], params[:, :3]), axis=1)
+numpy.savetxt(os.path.join(mc_dir, "prefiltered_func_data_mcf.par"), _params)
+
+# Run FIX
+env = {
+    "FSL_FIX_MATLAB_ROOT": inputs["matlab_root"],
+    "PATH": inputs["fix_dir"]
+}
+fix_cmd= ["fix", ica_dir, inputs["training_file"], str(inputs["fix_thr"])]
+process = FSLWrapper(shfile=inputs["fsl_config"], env=env)
+process(cmd=fix_cmd)
+if process.stderr != "":
+    raise FSLRuntimeError(
+        fix_cmd[0], " ".join(fix_cmd[1:]), process.stderr + process.stdout)
+fix_file = os.path.join(ica_dir, "filtered_func_data_clean.nii.gz")
+fix_variance_normalized_file = os.path.join(
+    ica_dir, "filtered_func_data_clean_vn.nii.gz")
+outputs["fix_file"] = fix_file
+outputs["fix_variance_normalized_file"] = fix_variance_normalized_file
+
+
+"""
+Low pass spatial filtering with SUSAN
+"""
+# Create output directory for this step
+susan_dir = os.path.join(inputs["outdir"], "susan")
+if not os.path.isdir(susan_dir):
+    os.mkdir(susan_dir)
+
+# Call command
+smooth_file = os.path.join(susan_dir, "smooth_func_data.nii.gz")
+susan_cmd = [
+    "susan", fix_file, "-1", str(3. / numpy.sqrt(8 * numpy.log(2))), "3", "0",
+    "0", smooth_file]
+process = FSLWrapper(shfile=inputs["fsl_config"])
+process(cmd=susan_cmd)
+outputs["smooth_file"] = smooth_file
+
+
+"""
+Grand mean scaling
+"""
+# Create output directory for this step
+scaling_dir = os.path.join(inputs["outdir"], "scaling")
+if not os.path.isdir(scaling_dir):
+    os.mkdir(scaling_dir)
+
+# Call commands
+intnorm_file = os.path.join(scaling_dir, "intnorm_func_data.nii.gz")
+cmd = ["fslstats", smooth_file, "-k", func_brain_mask, "-p", "50"]
+process = FSLWrapper(shfile=inputs["fsl_config"])
+process(cmd=cmd)
+medianintensity = float(process.stdout)
+scaling_factor = 10000 / medianintensity
+cmd = ["fslmaths", smooth_file, "-mul", str(medianintensity), intnorm_file]
+process = FSLWrapper(shfile=inputs["fsl_config"])
+process(cmd=cmd)
+outputs["intnorm_file"] = intnorm_file
+
+
+"""
+Update the outputs and save them and the inputs in a 'logs' directory.
+"""
+logdir = os.path.join(inputs["outdir"], "logs")
+if not os.path.isdir(logdir):
+    os.mkdir(logdir)
+params = locals()
+for name, final_struct in [("inputs", inputs), ("outputs", outputs),
+                           ("runtime", runtime)]:
+    log_file = os.path.join(logdir, "{0}.json".format(name))
+    with open(log_file, "wt") as open_file:
+        json.dump(final_struct, open_file, sort_keys=True, check_circular=True,
+                  indent=4)
+if verbose > 1:
+    pprint("[info] Outputs:")
+    pprint(outputs)
